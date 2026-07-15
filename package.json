@@ -44,6 +44,6 @@
     "@opencode-ai/sdk": "1.18.1",
     "@types/node": "^20.11.0",
     "typescript": "^5.6.0",
-    "vitest": "^2.1.0"
+    "vitest": "^3.2.6"
   }
 }
