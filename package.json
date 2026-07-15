@@ -1,0 +1,49 @@
+{
+  "name": "opencode-permission-log",
+  "version": "1.0.0",
+  "description": "opencode plugin that logs permission prompt replies (once/always/reject) to a per-day JSON sidecar file, so static permission config can be tuned from real usage instead of re-approving the same pattern every session.",
+  "type": "module",
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "default": "./dist/index.js"
+    }
+  },
+  "files": [
+    "dist"
+  ],
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/athal7/opencode-permission-audit.git"
+  },
+  "homepage": "https://github.com/athal7/opencode-permission-audit#readme",
+  "bugs": "https://github.com/athal7/opencode-permission-audit/issues",
+  "keywords": [
+    "opencode",
+    "opencode-plugin",
+    "permissions",
+    "audit"
+  ],
+  "engines": {
+    "node": ">=18"
+  },
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "prepublishOnly": "npm run build && npm run test"
+  },
+  "peerDependencies": {
+    "@opencode-ai/plugin": ">=1.0.0"
+  },
+  "devDependencies": {
+    "@opencode-ai/plugin": "1.18.1",
+    "@opencode-ai/sdk": "1.18.1",
+    "@types/node": "^20.11.0",
+    "typescript": "^5.6.0",
+    "vitest": "^2.1.0"
+  }
+}
