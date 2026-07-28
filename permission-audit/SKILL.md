@@ -1,6 +1,6 @@
 ---
 name: permission-audit
-description: Audit opencode permission-prompt replies logged by the opencode-permission-log plugin — surface loosening candidates, denials, and friction signals against the current project's effective permission config. Detection-only: reports exact config file/key to change, never edits config itself. Use when tuning opencode's permission config or investigating repeated approval prompts.
+description: "Audit opencode permission-prompt replies logged by the opencode-permission-log plugin — surface loosening candidates, denials, and friction signals against the current project's effective permission config. Detection-only: reports exact config file/key to change, never edits config itself. Use when tuning opencode's permission config or investigating repeated approval prompts."
 license: MIT
 ---
 
