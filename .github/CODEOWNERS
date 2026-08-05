@@ -1,0 +1,4 @@
+# Each line is a pattern followed by one or more usernames or team names.
+# These owners will be challenged for reviews on Pull Requests.
+
+*       @athal7
