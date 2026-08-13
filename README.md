@@ -8,13 +8,18 @@ into actionable audit output (via an Agent Skill), so static permission
 config can be tuned from real usage instead of re-approving the same
 pattern every session.
 
-It contains two independent deliverables:
+This repository also supports **omp** (`@oh-my-pi/pi-coding-agent`), capturing
+its observed pattern-match decisions via an agent hook and running the same
+kind of "config vs. observed reality" audit against its bash-pattern approval list.
 
-- **`opencode-permission-log`** — an npm plugin that logs every permission
+It contains three deliverables:
+
+- **`opencode-permission-log`** — an npm plugin that logs every opencode permission
   reply to a local JSON sidecar file.
-- **`permission-audit`** — an Agent Skill that reads those sidecar files
-  and reports loosening candidates, denials, and friction against your
-  current permission config.
+- **`omp-permission-log.ts`** — an omp hook that intercepts bash tool calls, evaluates
+  them against your `bash.patterns`, and logs decisions (allow, prompt, deny) to sidecar files.
+- **`permission-audit`** — an Agent Skill that reads those sidecar files (for either opencode or omp)
+  and reports loosening candidates, denials, friction, and dead configurations.
 
 ## Plugin: `opencode-permission-log`
 
@@ -40,9 +45,7 @@ Add it to opencode's plugin list, either globally (all projects) in
 }
 ```
 
-or scoped to a single project in that project's `./opencode.json`. opencode
-auto-installs npm plugins via Bun at startup — there's no separate
-`npm install` step to run yourself.
+or scoped to a single project in that project's `./opencode.json`.
 
 ### Sidecar files
 
@@ -52,74 +55,76 @@ Entries are written to:
 ~/.local/share/opencode/storage/plugin/opencode-permission-log/<YYYY-MM-DD>.json
 ```
 
-one file per UTC day, capped at the 500 most recent entries per day (see
-`DAY_FILE_CAP` in `src/log-store.ts`). Each file is a `DayFile`:
+## Omp Hook: `omp-permission-log.ts`
 
-```ts
-interface DayFile {
-  version: 1;
-  date: string;          // "YYYY-MM-DD" (UTC)
-  entries: SidecarEntry[];
-}
+### What it does
 
-interface SidecarEntry {
-  timestamp: string;     // ISO 8601
-  sessionID: string;
-  permission: string;    // e.g. "bash"
-  patterns: string[];    // normalized from Permission.pattern
-  response: "once" | "always" | "reject";
-}
+Hooks into `omp`'s event/hook subsystem. On `tool_call` of the `bash` tool, it loads your project and global `.omp/config.yml` settings, parses `bash.patterns` and `tools.approvalMode`, evaluates the command (re-deriving the exact decision of allow/prompt/deny), and logs outcomes to daily JSON sidecars.
+
+### Install
+
+Run `omp` specifying the hook file:
+
+```bash
+omp --hook omp-permission-log.ts
 ```
 
-See `src/types.ts` for the authoritative definitions.
+Or copy the hook to your local hooks directory for auto-discovery:
 
-### Privacy
+```bash
+cp omp-permission-log.ts ~/.omp/agent/hooks/
+```
 
-Sidecar files are written only to your own local machine, under your own
-home directory. Nothing is transmitted anywhere by this plugin.
+### Sidecar files
+
+Entries are written to:
+
+```
+~/.local/share/omp/storage/plugin/omp-permission-log/<YYYY-MM-DD>.json
+```
+
+Each file is an `OmpDayFile`:
+
+```ts
+interface OmpDayFile {
+  version: 1;
+  date: string;          // "YYYY-MM-DD" (UTC)
+  entries: OmpSidecarEntry[];
+}
+
+interface OmpSidecarEntry {
+  timestamp: string;     // ISO 8601
+  sessionID: string;
+  command: string;       // Executed command
+  pattern: string | null;// Matched pattern rule, or null if none
+  decision: "allow" | "prompt" | "deny";
+}
+```
 
 ## Skill: `permission-audit`
 
 ### What it does
 
-Reads the `opencode-permission-log` sidecar files, merges your global and
-project `opencode.json` permission config, and reports:
+Reads the sidecar files and current configuration files, then reports actionable tuning recommendations.
 
-- **Loosening candidates** — patterns you've repeatedly replied `always`
-  to that the config doesn't yet `allow`.
-- **Denials** — patterns you've `reject`-ed.
-- **Friction** — patterns you've replied `once` to repeatedly (3+ times),
-  suggesting the prompt itself is just noise.
-- **Policy concerns** / **Ambiguous** — non-builtin (custom tool / MCP)
-  permission keys, flagged separately and never auto-suggested for
-  loosening.
-
-It is **detection-only**: it never writes to any `opencode.json` and never
-applies a diff. It only prints a report for a human to act on.
-
-### Install
-
-Copy (or clone) the `permission-audit/` directory into the consuming
-project's skill directory. Per the
-[agentskills.io](https://agentskills.io/specification) convention, the
-directory name must stay `permission-audit` (it must match the `name:` in
-its `SKILL.md` frontmatter).
+- In **opencode mode**, it reports loosening candidates, denials, and friction.
+- In **omp mode**, it reports friction (patterns frequently prompting), dead configuration (configured rules that have never matched and are candidates for removal), denials, and active patterns.
 
 ### Usage
 
-```
+#### For opencode:
+
+```bash
 node permission-audit/scripts/audit.mjs --project "$PWD"
 ```
 
-This is the exact instruction an agent following the skill will run; see
-`permission-audit/SKILL.md` for the full workflow (how to parse and
-present the JSON output).
+#### For omp:
 
-The skill has **no code dependency** on the `opencode-permission-log` npm
-package above — `audit.mjs` is a standalone, zero-dependency Node ESM
-script that only reads the JSON sidecar files that plugin produces. They
-are designed to be used together but can be copied into other repos
-independently of each other.
+```bash
+node permission-audit/scripts/audit.mjs --project "$PWD" --omp
+```
+
+See `permission-audit/SKILL.md` for the full workflow and instructions.
 
 ## Credit
 
@@ -133,6 +138,6 @@ MIT — see [LICENSE](./LICENSE).
 
 ## Development
 
-```
+```bash
 npm install && npm test && npm run build
 ```
