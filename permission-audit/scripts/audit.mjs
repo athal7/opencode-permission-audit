@@ -1,10 +1,11 @@
 #!/usr/bin/env node
 // Zero-dependency, standalone reporting tool for the opencode-permission-log
-// sidecar files. Deliberately has no import from ../../src — this script
-// gets copied on its own into other repos as part of the permission-audit
-// Agent Skill, so it must not depend on the npm package's source tree.
+// sidecar files and oh-my-pi/pi-coding-agent (omp) config & sidecar files.
+// Deliberately has no import from ../../src — this script gets copied on its
+// own into other repos as part of the permission-audit Agent Skill, so it
+// must not depend on the npm package's source tree.
 //
-// Detection-only: this script never writes to any opencode.json. It only
+// Detection-only: this script never writes to any configuration files. It only
 // reads sidecar day files and config files, and prints a JSON report.
 
 import { readFileSync, readdirSync, existsSync } from "node:fs";
@@ -19,6 +20,16 @@ const DEFAULT_SIDECAR_DIR = join(
   "storage",
   "plugin",
   "opencode-permission-log"
+);
+
+const DEFAULT_OMP_SIDECAR_DIR = join(
+  homedir(),
+  ".local",
+  "share",
+  "omp",
+  "storage",
+  "plugin",
+  "omp-permission-log"
 );
 
 // opencode's own core tool permissions — already well-understood, so the
@@ -49,17 +60,18 @@ const FRICTION_THRESHOLD = 3;
 
 function usage() {
   return [
-    "Usage: audit.mjs [--project <dir>] [--sidecar <dir>]",
+    "Usage: audit.mjs [--project <dir>] [--sidecar <dir>] [--omp]",
     "",
-    "  --project <dir>  Project directory to read opencode.json from (default: cwd)",
+    "  --project <dir>  Project directory to read config from (default: cwd)",
     "  --sidecar <dir>  Sidecar directory containing day-file JSONs",
-    `                   (default: ${DEFAULT_SIDECAR_DIR})`,
+    `                   (default: ${DEFAULT_SIDECAR_DIR} or ${DEFAULT_OMP_SIDECAR_DIR} if --omp is set)`,
+    "  --omp            Run in oh-my-pi (omp) mode with bash pattern approval lists",
     "",
   ].join("\n");
 }
 
 function parseArgs(argv) {
-  const args = { project: process.cwd(), sidecar: DEFAULT_SIDECAR_DIR };
+  const args = { project: process.cwd(), sidecar: null, omp: false };
   for (let i = 0; i < argv.length; i++) {
     const arg = argv[i];
     if (arg === "--project") {
@@ -70,9 +82,14 @@ function parseArgs(argv) {
       const value = argv[++i];
       if (value === undefined) throw new Error("--sidecar requires a value");
       args.sidecar = value;
+    } else if (arg === "--omp") {
+      args.omp = true;
     } else {
       throw new Error(`unknown argument: ${arg}`);
     }
+  }
+  if (args.sidecar === null) {
+    args.sidecar = args.omp ? DEFAULT_OMP_SIDECAR_DIR : DEFAULT_SIDECAR_DIR;
   }
   return args;
 }
@@ -87,11 +104,6 @@ function globToRegex(glob) {
 /**
  * Resolves the effective verdict for a (type, pattern) pair against a
  * merged permission config block.
- *
- * This is a deliberate approximation of opencode's real permission
- * resolution (documented in the report's `notes`): exact match wins, then
- * the most specific glob match (longest key), then a `"*"` fallback, then
- * "unset" if the type has no entry at all.
  */
 function resolveVerdict(mergedPermission, type, pattern) {
   const entry = mergedPermission[type];
@@ -130,10 +142,8 @@ function mergePermission(globalPermission, projectPermission) {
     } else if (globalEntry === undefined) {
       merged[type] = projectEntry;
     } else if (isPlainObject(globalEntry) && isPlainObject(projectEntry)) {
-      // Both are the pattern-map object form — merge keys, project wins on collision.
       merged[type] = { ...globalEntry, ...projectEntry };
     } else {
-      // Mismatched shapes (string vs object) or both strings — project wins outright.
       merged[type] = projectEntry;
     }
   }
@@ -191,10 +201,7 @@ function loadDayFiles(sidecarDir, notes) {
 }
 
 /**
- * Aggregates all sidecar entries by (permission, pattern). An entry with
- * multiple patterns contributes to each pattern's aggregate independently.
- * Entries with no pattern (an empty `patterns` array) aggregate under the
- * empty-string pattern, representing "applies broadly, no specific pattern".
+ * Aggregates all sidecar entries by (permission, pattern).
  */
 function aggregateEntries(dayFiles) {
   const aggregates = new Map();
@@ -247,8 +254,6 @@ function classifyAggregates(aggregates, mergedPermission, configSources) {
     const flagged = classifyPermissionType(type);
     const hasAlwaysOrReject = counts.always > 0 || counts.reject > 0;
 
-    // Policy-concern / ambiguous classification short-circuits: an aggregate
-    // can appear in at most one category when it trips this heuristic.
     if (flagged && hasAlwaysOrReject) {
       const response = counts.always > 0 ? "always" : "reject";
       const target = flagged === "policyConcerns" ? policyConcerns : ambiguous;
@@ -266,9 +271,6 @@ function classifyAggregates(aggregates, mergedPermission, configSources) {
       continue;
     }
 
-    // Independent checks below: a single aggregate can land in more than
-    // one of loosening/denials/friction if its history contains a mix of
-    // always/reject/once replies over time.
     if (counts.always > 0) {
       const currentVerdict = resolveVerdict(mergedPermission, type, pattern);
       if (currentVerdict !== "allow") {
@@ -300,7 +302,238 @@ function classifyAggregates(aggregates, mergedPermission, configSources) {
   return { loosening, denials, friction, policyConcerns, ambiguous };
 }
 
+// =================================═══════════════════════════════════════════
+// OMP Mode Support
+// =================================═══════════════════════════════════════════
+
+export function parseSimpleYaml(content) {
+  const lines = content.split(/\r?\n/);
+  let currentKey = null;
+  let inBashPatterns = false;
+  let currentPatternRule = null;
+  const bashPatterns = [];
+  let approvalMode = null;
+
+  for (let line of lines) {
+    const hashIdx = line.indexOf("#");
+    if (hashIdx !== -1) {
+      line = line.slice(0, hashIdx);
+    }
+    const trimmed = line.trim();
+    if (trimmed.length === 0) continue;
+
+    const indent = line.length - line.trimStart().length;
+
+    const colonIdx = trimmed.indexOf(":");
+    if (colonIdx !== -1) {
+      const key = trimmed.slice(0, colonIdx).trim();
+      const val = trimmed.slice(colonIdx + 1).trim();
+
+      if (key === "bash.patterns" || (key === "patterns" && currentKey === "bash")) {
+        inBashPatterns = true;
+        continue;
+      } else if (key === "tools.approvalMode" || (key === "approvalMode" && currentKey === "tools")) {
+        approvalMode = val.replace(/['"]/g, "").trim();
+        inBashPatterns = false;
+        continue;
+      }
+
+      if (indent === 0) {
+        currentKey = key;
+        inBashPatterns = false;
+      }
+    }
+
+    if (inBashPatterns) {
+      if (trimmed.startsWith("-")) {
+        if (currentPatternRule) {
+          bashPatterns.push(currentPatternRule);
+        }
+        currentPatternRule = {};
+        const rest = trimmed.slice(1).trim();
+        const cIdx = rest.indexOf(":");
+        if (cIdx !== -1) {
+          const k = rest.slice(0, cIdx).trim();
+          const v = rest.slice(cIdx + 1).trim().replace(/['"]/g, "");
+          currentPatternRule[k] = v;
+        }
+      } else {
+        const cIdx = trimmed.indexOf(":");
+        if (cIdx !== -1 && currentPatternRule) {
+          const k = trimmed.slice(0, cIdx).trim();
+          const v = trimmed.slice(cIdx + 1).trim().replace(/['"]/g, "");
+          currentPatternRule[k] = v;
+        }
+      }
+    }
+  }
+
+  if (currentPatternRule) {
+    bashPatterns.push(currentPatternRule);
+  }
+
+  return {
+    "bash.patterns": bashPatterns,
+    "tools.approvalMode": approvalMode
+  };
+}
+
+function loadOmpConfig(projectDir) {
+  const projectPaths = [
+    join(projectDir, ".omp", "config.yml"),
+    join(projectDir, ".omp", "config.yaml"),
+  ];
+  const globalPaths = [
+    join(homedir(), ".omp", "agent", "config.yml"),
+    join(homedir(), ".omp", "agent", "config.yaml"),
+    join(homedir(), ".omp", "config.yml"),
+    join(homedir(), ".omp", "config.yaml"),
+  ];
+
+  let projectPath = null;
+  let projectContent = null;
+  for (const path of projectPaths) {
+    if (existsSync(path)) {
+      projectPath = path;
+      try {
+        projectContent = readFileSync(path, "utf8");
+      } catch {}
+      break;
+    }
+  }
+
+  let globalPath = null;
+  let globalContent = null;
+  for (const path of globalPaths) {
+    if (existsSync(path)) {
+      globalPath = path;
+      try {
+        globalContent = readFileSync(path, "utf8");
+      } catch {}
+      break;
+    }
+  }
+
+  return {
+    projectPath,
+    projectContent,
+    globalPath,
+    globalContent,
+  };
+}
+
+function buildOmpReport(args) {
+  const notes = [
+    "config merge is an approximation of omp's real resolution logic",
+    "glob matching is simplified (basic * wildcard only)",
+  ];
+
+  const configInfo = loadOmpConfig(args.project);
+
+  const configSources = {
+    global: configInfo.globalPath,
+    project: configInfo.projectPath,
+  };
+
+  const parsedGlobal = configInfo.globalContent ? parseSimpleYaml(configInfo.globalContent) : { "bash.patterns": [], "tools.approvalMode": null };
+  const parsedProject = configInfo.projectContent ? parseSimpleYaml(configInfo.projectContent) : { "bash.patterns": [], "tools.approvalMode": null };
+
+  const approvalMode = parsedProject["tools.approvalMode"] || parsedGlobal["tools.approvalMode"] || "yolo";
+  const mergedPatterns = [...(parsedProject["bash.patterns"] || []), ...(parsedGlobal["bash.patterns"] || [])];
+
+  const sidecarDir = resolve(args.sidecar);
+  const dayFiles = loadDayFiles(sidecarDir, notes);
+
+  // Aggregate OMP logs
+  const aggregates = new Map();
+  let entriesScanned = 0;
+
+  for (const dayFile of dayFiles) {
+    for (const entry of dayFile.entries) {
+      entriesScanned++;
+      const patternKey = entry.pattern || ""; // empty string if none matched
+      const key = `${patternKey}\u0000${entry.decision}`;
+      let aggregate = aggregates.get(key);
+      if (!aggregate) {
+        aggregate = {
+          pattern: entry.pattern,
+          decision: entry.decision,
+          occurrences: 0,
+          commands: new Set(),
+          lastSeen: entry.timestamp,
+        };
+        aggregates.set(key, aggregate);
+      }
+      aggregate.occurrences++;
+      if (entry.command) {
+        aggregate.commands.add(entry.command);
+      }
+      if (entry.timestamp > aggregate.lastSeen) {
+        aggregate.lastSeen = entry.timestamp;
+      }
+    }
+  }
+
+  const listAggregates = [...aggregates.values()];
+
+  const friction = [];
+  const denials = [];
+  const active = [];
+
+  for (const agg of listAggregates) {
+    const item = {
+      pattern: agg.pattern || "(none)",
+      occurrences: agg.occurrences,
+      lastSeen: agg.lastSeen,
+      commands: [...agg.commands],
+    };
+
+    if (agg.decision === "deny") {
+      denials.push(item);
+    } else if (agg.decision === "prompt") {
+      friction.push(item);
+    } else if (agg.decision === "allow") {
+      active.push(item);
+    }
+  }
+
+  // Find dead config patterns
+  const matchedPatterns = new Set(listAggregates.map(a => a.pattern).filter(Boolean));
+  const deadConfig = [];
+  for (const rule of mergedPatterns) {
+    if (!matchedPatterns.has(rule.match)) {
+      deadConfig.push({
+        pattern: rule.match,
+        approval: rule.approval,
+      });
+    }
+  }
+
+  const dates = dayFiles.map((d) => d.date).sort();
+  const dateRange = dates.length > 0 ? [dates[0], dates[dates.length - 1]] : ["", ""];
+
+  return {
+    generatedAt: new Date().toISOString(),
+    sidecarDir,
+    configSources,
+    totals: { entriesScanned, days: dayFiles.length, dateRange },
+    friction,
+    deadConfig,
+    denials,
+    active,
+    notes,
+  };
+}
+
+// =================================═══════════════════════════════════════════
+// Core Orchestration
+// =================================═══════════════════════════════════════════
+
 function buildReport(args) {
+  if (args.omp) {
+    return buildOmpReport(args);
+  }
+
   const notes = [
     "config merge is an approximation of opencode's real resolution logic",
     "glob matching is simplified (basic * wildcard only)",
@@ -346,6 +579,8 @@ function buildReport(args) {
   };
 }
 
+import { fileURLToPath } from "node:url";
+
 function main() {
   let args;
   try {
@@ -379,4 +614,8 @@ function main() {
   process.exit(0);
 }
 
-main();
+const isMain = process.argv[1] && resolve(process.argv[1]) === fileURLToPath(import.meta.url);
+
+if (isMain) {
+  main();
+}
